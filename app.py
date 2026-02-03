@@ -7,111 +7,86 @@ import os
 import json
 import re
 
-# 🔑 Configure Gemini
+# 1. 🔑 CONFIGURATION (Stable 2026 Setup)
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("Missing GEMINI_API_KEY. Please add it to Streamlit Secrets.")
+    st.error("Missing API Key. Add 'GEMINI_API_KEY' to Streamlit Secrets.")
 
-st.set_page_config(page_title="Shipping Bill Extractor", layout="wide")
+st.set_page_config(page_title="Customs Data Extractor", layout="wide")
 st.title("🚢 SHIPPING BILL DATA EXTRACTOR")
 
-# ---------- Helper Functions ----------
-
-def extract_text_from_pdf(file_path):
-    text = ""
-    with fitz.open(file_path) as doc:
-        for page in doc:
-            # Use 'dict' mode to preserve structural proximity for higher accuracy
-            text += page.get_text("text")
-    return text.strip()
-
-def extract_with_ai(batch_texts):
-    # Use the most stable high-performance model
-    MODEL_NAME = "gemini-1.5-flash" 
+# 2. 🧠 CORE AI EXTRACTION (Updated to Gemini 2.5 Flash)
+def extract_with_ai(file_text, file_name):
+    # Using the current stable 2026 model to avoid 404 errors
+    MODEL_NAME = "gemini-2.5-flash" 
     
     prompt = f"""
-    You are a professional customs auditor. Extract data from these Indian Shipping Bills with 100% accuracy.
+    Return a JSON ARRAY for this Shipping Bill. 
+    ACCURACY IS CRITICAL.
     
-    CRITICAL INSTRUCTION FOR LUT: 
-    Look at the 'STATUS' table (usually Page 1). Find column '11.LUT'. 
-    If the value directly below '11.LUT' is 'N', return 'N'. 
-    If it is 'Y', return 'Y'. 
-    DO NOT guess based on IGST amounts. Look ONLY at the status indicator.
-
-    Fields to Extract:
-    1. .INV NO. (Invoice Number - usually found in PART-III or near the top)
-    2. SB No (Shipping Bill Number)
-    3. SB date (Format: DD-MMM-YY)
-    4. Port code (e.g., INHYD4)
-    5. LUT (Strictly 'Y' or 'N' from field 11)
-    6. IGST AMT (Numeric value from the Integrated Tax field)
-
-    Return results ONLY as a JSON ARRAY.
-    Documents: {json.dumps(batch_texts)}
+    1. ".INV NO.": Find the Invoice Number (often near the top or in Part III).
+    2. "SB No": The Shipping Bill Number.
+    3. "SB date": The Shipping Bill Date (DD-MMM-YY).
+    4. "Port code": The 6-character port identifier (e.g., INHYD4).
+    5. "LUT": Strictly 'Y' if '11.LUT' in the Status table shows 'Y'. 
+       If it shows 'N', return 'N'. Do not guess based on taxes.
+    6. "IGST AMT": The total Integrated Tax amount (numeric only).
+    
+    Document Context: {file_name}
+    Content: {file_text[:15000]}
     """
 
     try:
         model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content(prompt)
         
-        # Clean response
+        # Robust JSON cleaning
         clean_text = response.text.replace('```json', '').replace('```', '').strip()
         match = re.search(r"\[.*\]", clean_text, re.DOTALL)
-        
         return json.loads(match.group(0)) if match else []
     except Exception as e:
-        st.error(f"Extraction Error: {e}")
+        if "404" in str(e):
+            st.warning(f"Model {MODEL_NAME} not found. Trying fallback model...")
+            # Fallback to general latest alias
+            model = genai.GenerativeModel("gemini-flash-latest")
+            return json.loads(re.search(r"\[.*\]", model.generate_content(prompt).text, re.DOTALL).group(0))
+        elif "429" in str(e):
+            st.error("🚨 QUOTA ERROR: Your key has 'Limit 0'. You MUST link a billing account in Google AI Studio Settings to activate your free quota.")
         return []
 
-# ---------- UI Layout ----------
-
+# 3. 📂 FILE PROCESSING
 uploaded_files = st.file_uploader("Upload Shipping Bill PDFs", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files:
-    if st.button("Generate Accurate Excel Report"):
-        all_data = []
-        with st.spinner("AI is performing deep scan for accuracy..."):
-            for uploaded in uploaded_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded.read())
-                    text = extract_text_from_pdf(tmp.name)
-                os.remove(tmp.name)
-                
-                # Send text (first 15k chars for deep context)
-                res = extract_with_ai([{"Source": uploaded.name, "Text": text[:15000]}])
-                if res:
-                    all_data.extend(res)
+if uploaded_files and st.button("🚀 Process & Generate Excel"):
+    final_rows = []
+    for uploaded in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded.read())
+            doc = fitz.open(tmp.name)
+            text = "".join([page.get_text() for page in doc])
+            doc.close()
+        os.remove(tmp.name)
+        
+        data = extract_with_ai(text, uploaded.name)
+        if data: final_rows.extend(data)
 
-        if all_data:
-            df = pd.DataFrame(all_data)
+    if final_rows:
+        df = pd.DataFrame(final_rows)
+        
+        # Enforce exact column order and labels requested
+        cols = [".INV NO.", "SB No", "SB date", "LUT", "IGST AMT", "Port code"]
+        for c in cols: 
+            if c not in df.columns: df[c] = "N/A"
             
-            # Reorder columns to ensure .INV NO. is first
-            desired_order = [".INV NO.", "SB No", "SB date", "Port code", "LUT", "IGST AMT"]
-            
-            # Ensure all columns exist to prevent errors
-            for col in desired_order:
-                if col not in df.columns:
-                    df[col] = "Not Found"
-            
-            df = df[desired_order]
-
-            # Rename columns to your exact required labels
-            final_mapping = {
-                ".INV NO.": ".INV NO.",
-                "SB No": "SB No", 
-                "SB date": "SB date", 
-                "LUT": 'LUT "Y" or "N"', 
-                "IGST AMT": '"IGST AMT"', 
-                "Port code": '"Port code"'
-            }
-            df.rename(columns=final_mapping, inplace=True)
-            
-            st.success("✅ Extraction Complete")
-            st.dataframe(df)
-
-            # Excel Export
-            excel_name = "Final_Shipping_Bill_Data.xlsx"
-            df.to_excel(excel_name, index=False)
-            with open(excel_name, "rb") as f:
-                st.download_button("📥 Download Accurate Excel", f, file_name=excel_name)
+        df = df[cols]
+        df.rename(columns={"LUT": 'LUT "Y" or "N"', "IGST AMT": '"IGST AMT"', "Port code": '"Port code"'}, inplace=True)
+        
+        st.success("Extraction Successful!")
+        st.dataframe(df)
+        
+        # Direct Excel Download
+        output = "Shipping_Bill_Data.xlsx"
+        df.to_excel(output, index=False)
+        with open(output, "rb") as f:
+            st.download_button("📥 Download Excel Report", f, file_name=output)
