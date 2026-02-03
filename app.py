@@ -9,25 +9,16 @@ import re
 
 # 🔑 Configure Gemini
 if "GEMINI_API_KEY" in st.secrets:
+    # Setting the API key
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("Add your GEMINI_API_KEY to Streamlit Secrets.")
+    st.error("Missing GEMINI_API_KEY in Streamlit Secrets.")
 
 st.set_page_config(page_title="Shipping Bill Extractor", layout="wide")
-st.title("🚢 SHIPPING BILL EXTRACTOR")
-
-# ---------- Model Selector (Side bar) ----------
-with st.sidebar:
-    st.header("Settings")
-    # gemini-1.5-flash-lite usually has the highest free daily quota
-    selected_model = st.selectbox(
-        "Select AI Model (Switch if you get Quota Error)",
-        ["gemini-1.5-flash-lite", "gemini-1.5-flash", "gemini-2.0-flash"],
-        index=0
-    )
-    st.info("💡 If you get a '429 Quota Exceeded' error, try switching to 'flash-lite' or wait a few minutes.")
+st.title("🚢 SHIPPING BILL DATA EXTRACTOR")
 
 # ---------- Helper Functions ----------
+
 def extract_text_from_pdf(file_path):
     text = ""
     with fitz.open(file_path) as doc:
@@ -35,55 +26,83 @@ def extract_text_from_pdf(file_path):
             text += page.get_text("text")
     return text.strip()
 
-def extract_with_ai(batch_texts, model_name):
+def extract_with_ai(batch_texts):
+    # FIX: Using the newest stable model name
+    # Ensure you are using the latest version of google-generativeai
+    MODEL_NAME = "gemini-2.0-flash-lite" 
+    
     prompt = f"""
-    Return a JSON ARRAY. Fields: "SB No", "SB date", "LUT", "IGST AMT", "Port code", "Source".
-    LUT: 'Y' if under LUT/Bond, 'N' if IGST paid.
+    Extract data from these Shipping Bills into a JSON ARRAY. 
+    Required Fields: "SB No", "SB date", "LUT", "IGST AMT", "Port code", "Source".
+    LUT: 'Y' if exported under LUT, 'N' if IGST paid.
+    
+    Return ONLY a JSON array. 
     Documents: {json.dumps(batch_texts)}
     """
+
     try:
-        model = genai.GenerativeModel(model_name)
+        # Initializing the model
+        model = genai.GenerativeModel(MODEL_NAME)
+        
+        # Calling the API
         response = model.generate_content(prompt)
         
-        # Simple JSON extraction
+        # Standard cleaning of the AI response
         clean_text = response.text.replace('```json', '').replace('```', '').strip()
         match = re.search(r"\[.*\]", clean_text, re.DOTALL)
-        return json.loads(match.group(0)) if match else []
+        
+        if match:
+            return json.loads(match.group(0))
+        return []
+        
     except Exception as e:
-        if "429" in str(e):
-            st.error("🚨 Quota Exceeded! Please switch the model in the sidebar or add a billing account to your Google AI project.")
+        # Specifically handling 404 (Model Not Found) or 429 (Quota) errors
+        if "404" in str(e):
+            st.error(f"Model Error: {MODEL_NAME} not found. Your API key might not have access to this model yet. Try changing the model name to 'gemini-1.5-flash'.")
+        elif "429" in str(e):
+            st.error("Quota Exceeded: Please add a billing account to your Google AI Studio project to unlock your limits.")
         else:
             st.error(f"Error: {e}")
         return []
 
 # ---------- Main UI ----------
-uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload Shipping Bill PDFs", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files and st.button("Extract Data"):
-    all_extracted_data = []
-    
-    for uploaded in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded.read())
-            text = extract_text_from_pdf(tmp.name)
-        os.remove(tmp.name)
+if uploaded_files:
+    if st.button("Process Documents"):
+        all_results = []
+        progress_bar = st.progress(0)
         
-        # Process each file to minimize token count per request
-        res = extract_with_ai([{"Source": uploaded.name, "Text": text[:10000]}], selected_model)
-        if res:
-            all_extracted_data.extend(res)
+        for idx, uploaded in enumerate(uploaded_files):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded.read())
+                text = extract_text_from_pdf(tmp.name)
+            os.remove(tmp.name)
+            
+            # Send small batches to stay within free token limits
+            res = extract_with_ai([{"Source": uploaded.name, "Text": text[:10000]}])
+            if res:
+                all_results.extend(res)
+            
+            progress_bar.progress((idx + 1) / len(uploaded_files))
 
-    if all_extracted_data:
-        df = pd.DataFrame(all_extracted_data)
-        # Rename columns to your specific requirement
-        rename_map = {
-            "SB No": "SB No", "SB date": "SB date", 
-            "LUT": 'LUT "Y" or "N"', "IGST AMT": '"IGST AMT"', "Port code": '"Port code"'
-        }
-        df.rename(columns=rename_map, inplace=True)
-        st.dataframe(df)
-        
-        # Excel Download
-        df.to_excel("Export.xlsx", index=False)
-        with open("Export.xlsx", "rb") as f:
-            st.download_button("📥 Download Excel", f, file_name="Shipping_Bill_Data.xlsx")
+        if all_results:
+            df = pd.DataFrame(all_results)
+            # Final column cleanup to match your specific requirement
+            final_map = {
+                "SB No": "SB No", 
+                "SB date": "SB date", 
+                "LUT": 'LUT "Y" or "N"', 
+                "IGST AMT": '"IGST AMT"', 
+                "Port code": '"Port code"'
+            }
+            df.rename(columns=final_map, inplace=True)
+            
+            st.success("Extraction Complete")
+            st.dataframe(df)
+
+            # Excel Export
+            out_file = "Shipping_Bill_Data.xlsx"
+            df.to_excel(out_file, index=False)
+            with open(out_file, "rb") as f:
+                st.download_button("📥 Download Excel", f, file_name="Shipping_Bill_Data.xlsx")
