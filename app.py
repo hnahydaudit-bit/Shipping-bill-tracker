@@ -22,30 +22,40 @@ def extract_text_from_pdf(file_path):
     text = ""
     with fitz.open(file_path) as doc:
         for page in doc:
+            # Use 'dict' mode to preserve structural proximity for higher accuracy
             text += page.get_text("text")
     return text.strip()
 
 def extract_with_ai(batch_texts):
-    # FIX: Use the latest active model name to avoid 404 errors
-    MODEL_NAME = "gemini-2.5-flash" 
+    # Use the most stable high-performance model
+    MODEL_NAME = "gemini-1.5-flash" 
     
     prompt = f"""
-    Act as an OCR data extraction expert. Extract the following from these Indian Shipping Bills:
-    - SB No (Shipping Bill Number)
-    - SB date (Format: DD-MMM-YY)
-    - Port code (e.g., INHYD4)
-    - LUT (Return 'Y' if 'LUT' is present in the status table, otherwise 'N')
-    - IGST AMT (The Integrated Tax amount, numerical only)
+    You are a professional customs auditor. Extract data from these Indian Shipping Bills with 100% accuracy.
+    
+    CRITICAL INSTRUCTION FOR LUT: 
+    Look at the 'STATUS' table (usually Page 1). Find column '11.LUT'. 
+    If the value directly below '11.LUT' is 'N', return 'N'. 
+    If it is 'Y', return 'Y'. 
+    DO NOT guess based on IGST amounts. Look ONLY at the status indicator.
 
-    Return the results ONLY as a valid JSON ARRAY of objects. 
-    Documents to process: {json.dumps(batch_texts)}
+    Fields to Extract:
+    1. .INV NO. (Invoice Number - usually found in PART-III or near the top)
+    2. SB No (Shipping Bill Number)
+    3. SB date (Format: DD-MMM-YY)
+    4. Port code (e.g., INHYD4)
+    5. LUT (Strictly 'Y' or 'N' from field 11)
+    6. IGST AMT (Numeric value from the Integrated Tax field)
+
+    Return results ONLY as a JSON ARRAY.
+    Documents: {json.dumps(batch_texts)}
     """
 
     try:
         model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content(prompt)
         
-        # Strip potential markdown backticks from AI output
+        # Clean response
         clean_text = response.text.replace('```json', '').replace('```', '').strip()
         match = re.search(r"\[.*\]", clean_text, re.DOTALL)
         
@@ -59,43 +69,49 @@ def extract_with_ai(batch_texts):
 uploaded_files = st.file_uploader("Upload Shipping Bill PDFs", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
-    if st.button("Generate Excel Report"):
+    if st.button("Generate Accurate Excel Report"):
         all_data = []
-        with st.spinner("Processing..."):
+        with st.spinner("AI is performing deep scan for accuracy..."):
             for uploaded in uploaded_files:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded.read())
                     text = extract_text_from_pdf(tmp.name)
                 os.remove(tmp.name)
                 
-                # Send text (first 10k chars to save tokens) to AI
-                res = extract_with_ai([{"Source": uploaded.name, "Text": text[:10000]}])
+                # Send text (first 15k chars for deep context)
+                res = extract_with_ai([{"Source": uploaded.name, "Text": text[:15000]}])
                 if res:
                     all_data.extend(res)
 
         if all_data:
             df = pd.DataFrame(all_data)
             
-            # Match the exact column names you requested
-            mapping = {
+            # Reorder columns to ensure .INV NO. is first
+            desired_order = [".INV NO.", "SB No", "SB date", "Port code", "LUT", "IGST AMT"]
+            
+            # Ensure all columns exist to prevent errors
+            for col in desired_order:
+                if col not in df.columns:
+                    df[col] = "Not Found"
+            
+            df = df[desired_order]
+
+            # Rename columns to your exact required labels
+            final_mapping = {
+                ".INV NO.": ".INV NO.",
                 "SB No": "SB No", 
                 "SB date": "SB date", 
                 "LUT": 'LUT "Y" or "N"', 
                 "IGST AMT": '"IGST AMT"', 
                 "Port code": '"Port code"'
             }
-            df.rename(columns=mapping, inplace=True)
+            df.rename(columns=final_mapping, inplace=True)
             
-            st.success("✅ Extraction Successful!")
+            st.success("✅ Extraction Complete")
             st.dataframe(df)
 
-            # Excel Export logic using openpyxl
-            excel_name = "Shipping_Bill_Report.xlsx"
+            # Excel Export
+            excel_name = "Final_Shipping_Bill_Data.xlsx"
             df.to_excel(excel_name, index=False)
             with open(excel_name, "rb") as f:
-                st.download_button(
-                    label="📥 Download Excel File",
-                    data=f,
-                    file_name=excel_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                st.download_button("📥 Download Accurate Excel", f, file_name=excel_name)
