@@ -8,13 +8,11 @@ import json
 import re
 
 # 🔑 Configure Gemini
-# This looks for the key in your Streamlit Cloud Secrets
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("Missing Gemini API Key. Please add it to Streamlit Secrets as GEMINI_API_KEY.")
+    st.error("Missing GEMINI_API_KEY in Streamlit Secrets.")
 
-# 🎨 Page setup
 st.set_page_config(page_title="SHIPPING BILL EXTRACTOR", page_icon="🚢", layout="wide")
 st.title("🚢 SHIPPING BILL DATA EXTRACTOR")
 
@@ -22,124 +20,86 @@ st.title("🚢 SHIPPING BILL DATA EXTRACTOR")
 
 def extract_text_from_pdf(file_path):
     text = ""
-    try:
-        with fitz.open(file_path) as doc:
-            for page in doc:
-                text += page.get_text("text")
-        return text.strip()
-    except Exception as e:
-        return f"Error reading PDF: {e}"
+    with fitz.open(file_path) as doc:
+        for page in doc:
+            text += page.get_text("text")
+    return text.strip()
 
 def extract_shipping_details_with_ai(batch_texts):
-    prompt = f"""
-You are an expert in Indian Customs Shipping Bills (ICEGATE).
-For EACH document provided, extract the specific details and return a JSON ARRAY.
-
-Fields required for each object:
-- SB No
-- SB Date
-- Port Code
-- LUT (Return "Y" if exported under LUT/Bond status, "N" if IGST was paid)
-- IGST AMT (The total Integrated Tax amount. If zero or not found, return 0)
-- Source (The filename)
-
-VERY IMPORTANT:
-1. Return ONLY a valid JSON array. 
-2. Do not include markdown formatting like ```json ... ```.
-3. If data is missing, use "Not Found".
-
-Documents:
-{json.dumps(batch_texts, indent=2)}
-"""
-
-    # FIX: Using the correct, standard model identifier
-    model = genai.GenerativeModel("gemini-1.5-flash") 
+    # Using the latest Gemini 2.0 Flash model to avoid 404/deprecated errors
+    # If this fails, try "gemini-1.5-flash" or "gemini-1.5-pro"
+    MODEL_NAME = "gemini-2.0-flash" 
     
+    prompt = f"""
+    Act as a customs data entry expert. Extract from these Indian Shipping Bills:
+    1. SB No
+    2. SB date
+    3. LUT "Y" or "N" (Look at the status table; mark Y if under LUT)
+    4. "IGST AMT" (Numerical value only)
+    5. "Port code" (6-character code like INHYD4)
+
+    Return a JSON ARRAY. If a value is missing, return null.
+    Documents: {json.dumps(batch_texts)}
+    """
+
     try:
+        model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content(prompt)
-        raw_text = response.text.strip()
         
-        # Clean potential markdown backticks if AI includes them
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```json\s*|```$", "", raw_text, flags=re.MULTILINE)
-        
-        # Find the JSON array part
-        match = re.search(r"\[.*\]", raw_text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        else:
-            # Fallback if AI didn't provide brackets
-            return json.loads(raw_text)
-            
+        # Clean response and extract JSON
+        clean_text = response.text.replace('```json', '').replace('```', '').strip()
+        match = re.search(r"\[.*\]", clean_text, re.DOTALL)
+        return json.loads(match.group(0)) if match else []
     except Exception as e:
-        st.error(f"AI Extraction Error: {e}")
+        st.error(f"Extraction Error: {str(e)}")
         return []
 
 # ---------- Streamlit UI ----------
 
-uploaded_files = st.file_uploader(
-    "📤 Upload Shipping Bill PDFs (ICEGATE Format)",
-    type=["pdf"],
-    accept_multiple_files=True
-)
+with st.sidebar:
+    st.header("Debug Tools")
+    if st.button("Check Available Models"):
+        try:
+            models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            st.write("Available models for your key:")
+            st.json(models)
+        except Exception as e:
+            st.error(f"Could not list models: {e}")
+
+uploaded_files = st.file_uploader("Upload Shipping Bill PDFs", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
-    if st.button("Extract Data"):
-        st.info("⏳ Processing files... This may take a moment.")
-        batch_texts = []
-
+    if st.button("Process All Files"):
+        batch_data = []
         for uploaded in uploaded_files:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(uploaded.read())
-                tmp_path = tmp.name
+                text = extract_text_from_pdf(tmp.name)
+            os.remove(tmp.name)
+            batch_data.append({"Source": uploaded.name, "Text": text[:15000]})
 
-            text = extract_text_from_pdf(tmp_path)
-            os.remove(tmp_path)
-
-            # Extract first 15,000 characters to cover multi-page bills without hitting token limits
-            batch_texts.append({
-                "Source": uploaded.name,
-                "Text": text[:15000] 
-            })
-
-        results = extract_shipping_details_with_ai(batch_texts)
+        with st.spinner("AI is reading your bills..."):
+            results = extract_shipping_details_with_ai(batch_data)
 
         if results:
-            # Define requested column names
-            # User requirement: "SB No", "SB date", LUT "Y" or "N", "IGST AMT", "Port code"
             df = pd.DataFrame(results)
-            
-            # Mapping extracted keys to requested column names
-            rename_map = {
+            # Match the exact column names requested by the user
+            mapping = {
                 "SB No": "SB No",
-                "SB Date": "SB date",
-                "LUT": 'LUT "Y" or "N"',
+                "SB date": "SB date",
+                "LUT \"Y\" or \"N\"": 'LUT "Y" or "N"',
                 "IGST AMT": '"IGST AMT"',
-                "Port Code": '"Port code"'
+                "Port code": '"Port code"'
             }
+            df.rename(columns=mapping, inplace=True)
             
-            df.rename(columns=rename_map, inplace=True)
-            
-            # Keep only the requested columns (and Source for reference)
-            final_cols = ["SB No", "SB date", 'LUT "Y" or "N"', '"IGST AMT"', '"Port code"', "Source"]
-            df = df[[c for c in final_cols if c in df.columns]]
+            st.success("Extraction Complete")
+            st.dataframe(df)
 
-            st.success(f"✅ Extracted data from {len(results)} file(s)")
-            st.dataframe(df, use_container_width=True)
-
-            # Create Excel Download
-            try:
-                out_file = "Shipping_Bill_Report.xlsx"
-                df.to_excel(out_file, index=False)
-
-                with open(out_file, "rb") as f:
-                    st.download_button(
-                        label="📥 Download Excel Report",
-                        data=f,
-                        file_name="Shipping_Bill_Report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-            except Exception as e:
-                st.error(f"Error creating Excel: {e}")
+            # Export to Excel
+            out_path = "Shipping_Bill_Data.xlsx"
+            df.to_excel(out_path, index=False)
+            with open(out_path, "rb") as f:
+                st.download_button("📥 Download Excel", f, file_name="Shipping_Bill_Data.xlsx")
         else:
-            st.error("No data could be extracted. Please ensure the PDF is a valid Shipping Bill.")
+            st.error("AI could not find the data. Try checking the 'Available Models' in the sidebar.")
